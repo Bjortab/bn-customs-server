@@ -1,23 +1,16 @@
 {
-  "name": "bn-custom-server",
-  "version": "0.1.0",
-  "description": "Bridge för BN: egen LLM/TTS med OpenAI/Ollama/Coqui",
+  "name": "bn-customs-server",
+  "version": "1.0.0",
   "main": "src/server.js",
-  "type": "commonjs",
+  "type": "module",
   "scripts": {
-    "dev": "node src/server.js",
     "start": "node src/server.js"
   },
-  "engines": {
-    "node": ">=18.17"
-  },
   "dependencies": {
-    "axios": "^1.7.7",
-    "cors": "^2.8.5",
-    "dotenv": "^16.4.5",
+    "axios": "^1.6.7",
+    "dotenv": "^16.4.1",
     "express": "^4.19.2",
-    "express-rate-limit": "^7.4.0",
     "morgan": "^1.10.0",
-    "openai": "^4.56.0"
+    "uuid": "^9.0.1"
   }
 }
