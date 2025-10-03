@@ -1,197 +1,128 @@
-// src/server.js
-// BN Custom Bridge — LLM & TTS
-// v2.0 GC (imports fixade till ./adapters/llm/*)
+// GC v2 — enkelfil-server för BN Custom Bridge (LLM + TTS)
+// Använder bara npm-paket: express, cors, openai
 
-import express from 'express';
-import cors from 'cors';
+import express from "express";
+import cors from "cors";
+import { OpenAI } from "openai";
 
-// ==== LLM-adapters (pekar nu på ./adapters/llm/) ====
-import openaiLLM from './adapters/llm/openai.js';
-let mistralLLM = null;
-try { mistralLLM = (await import('./adapters/llm/mistral.js')).default; } catch (_) { /* optional */ }
+const PORT = process.env.PORT || 10000;
 
-// ==== TTS-adapters (ligger i ./tts) ====
-import openaiTTS from './tts/openai.js';
-let elevenlabsTTS = null;
-let coquiTTS = null;
-try { elevenlabsTTS = (await import('./tts/elevenlabs.js')).default; } catch (_) { /* optional */ }
-try { coquiTTS = (await import('./tts/coqui.js')).default; } catch (_) { /* optional */ }
-
-// ==== Utils ====
-import { toDataUrl } from './utils/audio.js';
-import { cacheGet, cachePut } from './utils/cache.js';
-
-// ==== Env ====
-const {
-  PORT = 10000,
-  NODE_ENV = 'production',
-
-  // Auth + CORS
-  AUTH_TOKEN,
-  ALLOWED_ORIGINS, // kommaseparerad lista
-
-  // LLM
-  LLM_PROVIDER = 'openai',                 // 'openai' | 'mistral'
-  LLM_OPENAI_MODEL = 'gpt-4o-mini',
-  // valfritt för mistral: LLM_MISTRAL_MODEL
-
-  // TTS
-  TTS_PROVIDER = 'openai',                 // 'openai' | 'elevenlabs' | 'coqui'
-  OPENAI_TTS_MODEL = 'gpt-4o-mini-tts',
-  OPENAI_TTS_VOICE = 'alloy',
-  TTS_FORMAT = 'mp3',                      // 'mp3' | 'wav' | 'ogg'
-
-  // Debug
-  DEBUG = '0'
-} = process.env;
-
-// ==== App & CORS ====
-const app = express();
-app.use(express.json({ limit: '2mb' }));
-
-const allowList = (ALLOWED_ORIGINS || '')
-  .split(',')
+// Tillåtna origins för CORS
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
+  .split(",")
   .map(s => s.trim())
   .filter(Boolean);
 
-app.use(cors({
-  origin: (origin, cb) => {
-    if (!origin) return cb(null, true);                            // t.ex. curl/postman
-    if (allowList.length === 0 || allowList.includes(origin)) {
-      return cb(null, true);
-    }
-    return cb(new Error('CORS: Origin not allowed'), false);
-  }
-}));
+// OpenAI-nyckel och modeller
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+const LLM_OPENAI_MODEL = process.env.LLM_OPENAI_MODEL || "gpt-4o-mini";
+const OPENAI_TTS_MODEL = process.env.OPENAI_TTS_MODEL || "gpt-4o-mini-tts";
+const OPENAI_TTS_VOICE = process.env.OPENAI_TTS_VOICE || "alloy";
+const TTS_FORMAT = (process.env.TTS_FORMAT || "mp3").toLowerCase();
 
-// ==== Auth-middleware (valfritt – används om AUTH_TOKEN satt) ====
-app.use((req, res, next) => {
-  if (!AUTH_TOKEN) return next();
-  const tok = req.headers.authorization || '';
-  if (tok === AUTH_TOKEN) return next();
-  return res.status(401).json({ ok: false, error: 'unauthorized' });
-});
-
-// ==== Helpers ====
-const hasOpenAI = !!process.env.OPENAI_API_KEY;
-const hasEleven = !!process.env.ELEVENLABS_API_KEY;
-const hasCoqui  = !!process.env.COQUI_URL; // din coqui-adress om du kör det
-
-function pickLLM() {
-  const p = (LLM_PROVIDER || 'openai').toLowerCase();
-  if (p === 'mistral' && mistralLLM) return { name: 'mistral', run: mistralLLM };
-  return { name: 'openai', run: openaiLLM };
+if (!OPENAI_API_KEY) {
+  console.error("Saknar OPENAI_API_KEY i miljövariablerna!");
 }
 
-function pickTTS() {
-  const p = (TTS_PROVIDER || 'openai').toLowerCase();
-  if (p === 'elevenlabs' && elevenlabsTTS) return { name: 'elevenlabs', run: elevenlabsTTS };
-  if (p === 'coqui' && coquiTTS)           return { name: 'coqui', run: coquiTTS };
-  return { name: 'openai', run: openaiTTS };
+const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+const app = express();
+app.use(express.json({ limit: "2mb" }));
+
+app.use(
+  cors({
+    origin: (origin, cb) => {
+      if (!origin) return cb(null, true);
+      if (ALLOWED_ORIGINS.length === 0) return cb(null, true);
+      cb(null, ALLOWED_ORIGINS.includes(origin));
+    },
+  })
+);
+
+// Hjälpfunktioner
+const ok = (res, data) => res.json({ ok: true, ...data });
+const fail = (res, code, detail) => res.status(code).json({ ok: false, code, detail });
+
+// Systemprompt beroende på nivå
+function buildSystemPrompt({ lvl = 3, minutes = 3, lang = "sv" }) {
+  const tone =
+    lvl >= 5
+      ? "mycket explicit vuxeninnehåll, direkt språk, grafiska detaljer"
+      : lvl >= 4
+      ? "vuxet innehåll, sensuellt, tydligt men inte pornografiskt"
+      : lvl >= 3
+      ? "romantiskt och lätt suggestivt, inga grova ord"
+      : lvl >= 2
+      ? "mjuk romantik, hintar, inga detaljer"
+      : "helt familjevänligt";
+
+  const lengthHint =
+    minutes >= 5 ? "cirka 700–900 ord" :
+    minutes >= 3 ? "cirka 400–600 ord" : "cirka 200–350 ord";
+
+  return `Du skriver på svenska. Håll längden till ${lengthHint}.
+Ton: ${tone}. Använd dialog och avsluta berättelsen ordentligt.`;
 }
 
-// ==== /status ====
-app.get('/status', (req, res) => {
-  const llmChoice = pickLLM();
-  const ttsChoice = pickTTS();
-  const corsList = allowList.length ? allowList : ['*'];
+// ROUTES
 
-  return res.json({
-    ok: true,
-    worker: 'bn-customs-server',
-    env: NODE_ENV,
-    provider: {
-      llm: llmChoice.name.toUpperCase(),
-      tts: ttsChoice.name.toUpperCase()
-    },
-    model: {
-      lvl1_3: LLM_OPENAI_MODEL || 'gpt-4o-mini',
-      // valfritt: lvi5: process.env.LLM_MISTRAL_MODEL || 'mistral-small-latest'
-    },
-    tts: {
-      provider: ttsChoice.name.toUpperCase(),
-      model: OPENAI_TTS_MODEL,
-      voice: OPENAI_TTS_VOICE,
-      format: TTS_FORMAT
-    },
-    has_keys: {
-      openai: !!hasOpenAI,
-      elevenlabs: !!hasEleven,
-      coqui: !!hasCoqui
-    },
-    cors: corsList
+// Status
+app.get("/status", (_req, res) => {
+  ok(res, {
+    worker: "bn-customs-server",
+    provider: "openai",
+    llm: { model: LLM_OPENAI_MODEL, has_key: !!OPENAI_API_KEY },
+    tts: { model: OPENAI_TTS_MODEL, voice: OPENAI_TTS_VOICE, format: TTS_FORMAT },
+    cors: ALLOWED_ORIGINS,
   });
 });
 
-// ==== /llm ====
-app.post('/llm', async (req, res) => {
+// Textgenerering (LLM)
+app.post("/llm", async (req, res) => {
   try {
-    const { prompt = '', lvl = 3, minutes = 3, lang = 'sv' } = req.body || {};
-    if (!prompt || typeof prompt !== 'string') {
-      return res.status(400).json({ ok: false, error: 'prompt required' });
-    }
+    const { prompt = "", lvl = 3, minutes = 3 } = req.body || {};
+    if (!prompt) return fail(res, 400, "prompt_required");
 
-    // cache key (text-only)
-    const cacheKey = `llm:${lang}:${lvl}:${minutes}:${prompt.substring(0, 200)}`;
-    const cached = await cacheGet(cacheKey);
-    if (cached && cached.text) {
-      if (DEBUG === '1') console.log('[LLM] cache hit');
-      return res.json({ ok: true, cached: true, text: cached.text });
-    }
+    const system = buildSystemPrompt({ lvl, minutes });
 
-    const { run } = pickLLM();
-    const text = await run({
-      prompt, lvl, minutes, lang,
-      model: LLM_OPENAI_MODEL
+    const completion = await openai.chat.completions.create({
+      model: LLM_OPENAI_MODEL,
+      temperature: lvl >= 5 ? 1.0 : 0.8,
+      max_tokens: 1800,
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: prompt },
+      ],
     });
 
-    await cachePut(cacheKey, { text }, 60 * 60 * 24); // 24h
-    return res.json({ ok: true, cached: false, text });
+    const text = completion?.choices?.[0]?.message?.content?.trim() || "(inget svar)";
+    ok(res, { text });
   } catch (e) {
-    console.error('LLM error:', e);
-    return res.status(500).json({ ok: false, error: 'llm_failed', detail: String(e?.message || e) });
+    fail(res, 500, e?.message || "llm_error");
   }
 });
 
-// ==== /tts ====
-app.post('/tts', async (req, res) => {
+// TTS (text-till-tal)
+app.post("/tts", async (req, res) => {
   try {
-    const { text = '', lang = 'sv', voice = OPENAI_TTS_VOICE, format = TTS_FORMAT } = req.body || {};
-    if (!text || typeof text !== 'string') {
-      return res.status(400).json({ ok: false, error: 'text required' });
-    }
+    const { text = "" } = req.body || {};
+    if (!text) return fail(res, 400, "text_required");
 
-    // cache key (audio)
-    const cacheKey = `tts:${lang}:${voice}:${format}:${text.substring(0, 200)}`;
-    const cached = await cacheGet(cacheKey);
-    if (cached && cached.base64) {
-      if (DEBUG === '1') console.log('[TTS] cache hit');
-      return res.json({ ok: true, cached: true, audio: { format, base64: cached.base64 } });
-    }
-
-    const { run } = pickTTS();
-    const audioBuffer = await run({
-      text, lang,
-      voice: voice || OPENAI_TTS_VOICE,
+    const audio = await openai.audio.speech.create({
       model: OPENAI_TTS_MODEL,
-      format
+      voice: OPENAI_TTS_VOICE,
+      input: text,
+      format: TTS_FORMAT,
     });
 
-    // spara i cache
-    const base64 = audioBuffer.toString('base64');
-    await cachePut(cacheKey, { base64 }, 60 * 60 * 24); // 24h
-
-    return res.json({ ok: true, cached: false, audio: { format, base64 } });
+    const base64 = Buffer.from(await audio.arrayBuffer()).toString("base64");
+    ok(res, { audio_base64: base64, format: TTS_FORMAT, voice: OPENAI_TTS_VOICE });
   } catch (e) {
-    console.error('TTS error:', e);
-    return res.status(500).json({ ok: false, error: 'tts_failed', detail: String(e?.message || e) });
+    fail(res, 500, e?.message || "tts_error");
   }
 });
 
-// ==== Root ====
-app.get('/', (_req, res) => res.send('BN Custom Bridge up'));
+app.use((_req, res) => fail(res, 404, "not_found"));
 
-// ==== Start ====
 app.listen(PORT, () => {
-  console.log(`BN Custom Bridge listening on :${PORT}`);
+  console.log(`BN Custom Bridge kör på port ${PORT}`);
 });
